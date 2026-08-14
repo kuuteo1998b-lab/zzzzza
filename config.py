@@ -52,9 +52,9 @@ class Config:
     SESSION_NAME = os.getenv("SESSION_NAME", "session_bot")
 
     # ==========================================
-    # 📌 PROFILE TRÌNH DUYỆT CỐ ĐỊNH
+    # 📌 PROFILE TRÌNH DUYỆT CỐ ĐỊNH (Edge)
     # ==========================================
-    # (Camoufox tự quản lý profile — không cần BROWSER_PROFILE_BASE_DIR)
+    BROWSER_PROFILE_BASE_DIR = os.getenv("BROWSER_PROFILE_BASE_DIR", "browser_profiles/bot_profile")
 
     # ==========================================
     # 🔄 POLLING FALLBACK
