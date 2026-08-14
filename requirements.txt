@@ -3,8 +3,8 @@ telethon==1.35.0
 python-dotenv==1.0.1
 
 # ── Browser automation ────────────────────────────────────────────────────
-camoufox>=0.4.0
 playwright>=1.44.0
+# Sau khi cài xong, chạy: playwright install msedge
 
 # ── OCR ───────────────────────────────────────────────────────────────────
 pytesseract==0.3.10
