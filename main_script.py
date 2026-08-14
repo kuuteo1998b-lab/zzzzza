@@ -30,7 +30,6 @@ from telethon import TelegramClient, events
 from telethon.tl.types import MessageEntitySpoiler
 from telethon.network import ConnectionTcpAbridged
 from playwright.async_api import async_playwright
-from camoufox.async_api import AsyncCamoufox
 import ctypes, ctypes.wintypes  # Windows taskbar minimize/restore
 
 from config import Config
@@ -38,6 +37,7 @@ from logger_setup import logger
 from code_validator import CodeValidator
 from image_code_extractor import get_image_extractor
 from database import init_database
+from browser_profile_manager import BrowserProfileManager
 from rate_limiter import init_anti_detection
 from monitoring import init_monitoring
 from features import print_version_info, get_shutdown_handler
@@ -558,24 +558,26 @@ def get_user_profile_dir(user: str) -> str:
 
 _playwright_contexts: dict = {}
 _playwright_context_locks: dict = {}
-_camoufox_instance = None  # Camoufox browser instance (thay Playwright Chromium)
-_camoufox_launch_lock = None  # Global lock — chỉ 1 instance được tạo
-_shared_context = None  # 1 context duy nhất dùng chung cho tất cả tab
+_playwright_driver = None      # async_playwright().start() — driver process (thay Edge instance)
+_edge_launch_lock = None       # Global lock — chỉ 1 instance được tạo
+_shared_context = None         # BrowserContext (persistent) duy nhất dùng chung cho tất cả tab
+_profile_manager = None        # BrowserProfileManager — quản lý profile & dọn Edge process mồ côi
 
 
 def _get_launch_lock():
-    global _camoufox_launch_lock
-    if _camoufox_launch_lock is None:
-        _camoufox_launch_lock = asyncio.Lock()
-    return _camoufox_launch_lock
+    global _edge_launch_lock
+    if _edge_launch_lock is None:
+        _edge_launch_lock = asyncio.Lock()
+    return _edge_launch_lock
 
 
 async def get_or_launch_browser_context(user: str):
     """
-    Luôn trả về CÙNG 1 context duy nhất — tất cả tab chạy trong 1 cửa sổ.
+    Luôn trả về CÙNG 1 context duy nhất — tất cả tab chạy trong 1 cửa sổ Edge.
     Global lock đảm bảo không bao giờ tạo 2 instance song song.
+    Dùng launch_persistent_context(channel="msedge") — không còn Edge.
     """
-    global _camoufox_instance, _shared_context
+    global _playwright_driver, _shared_context, _profile_manager
 
     # Fast path: context đã có rồi
     if _shared_context is not None:
@@ -595,52 +597,65 @@ async def get_or_launch_browser_context(user: str):
                 _shared_context = None
 
         headless = getattr(Config, "HEADLESS_MODE", False)
-        logger.info(f"[Camoufox] Launch browser (1 instance duy nhất)")
+        logger.info(f"[Edge] Launch browser (1 instance duy nhất)")
 
-        if _camoufox_instance is None:
-            mon = _get_secondary_monitor_rect()          # ← màn hình PHỤ (1600x900)
-            mon_w = mon["right"]  - mon["left"]
-            mon_h = mon["bottom"] - mon["top"]
-            # Xáo trộn nội bộ: kích thước dao động ±5% để tránh fingerprint cố định
-            import random as _rnd
-            scale_w = _rnd.uniform(0.88, 0.96)
-            scale_h = _rnd.uniform(0.88, 0.96)
-            win_w = int(mon_w * scale_w)
-            win_h = int(mon_h * scale_h)
-            # Offset nhỏ từ góc trên-trái để không bị cắt viền
-            off_x = _rnd.randint(0, max(0, mon_w - win_w))
-            off_y = _rnd.randint(0, max(0, 30))
-            _camoufox_instance = await AsyncCamoufox(
-                headless=headless,
-                geoip=True,
-                os="windows",
-                screen={"width": mon_w, "height": mon_h},
-                viewport={"width": win_w, "height": win_h},
-            ).__aenter__()
-            logger.info(f"[Camoufox] Browser launched thành công")
-            # Ghim cửa sổ vào màn hình PHỤ
-            await asyncio.sleep(1.0)
-            hwnd = _find_camoufox_hwnd()
-            if hwnd:
-                ctypes.windll.user32.MoveWindow(
-                    hwnd,
-                    mon["left"] + off_x,   # X tuyệt đối trên màn phụ
-                    mon["top"]  + off_y,   # Y tuyệt đối trên màn phụ
-                    win_w, win_h,
-                    True,
-                )
-                logger.info(
-                    f"[Camoufox] Cửa sổ → màn phụ ({win_w}x{win_h} "
-                    f"@ {mon['left']+off_x},{mon['top']+off_y})"
-                )
+        if _profile_manager is None:
+            _profile_manager = BrowserProfileManager(
+                profile_base_dir=getattr(Config, "BROWSER_PROFILE_BASE_DIR", "browser_profiles/bot_profile")
+            )
+            # Dọn Edge process mồ côi (từ lần chạy trước bị crash) trước khi launch mới
+            _profile_manager.cleanup_orphan_processes()
 
-        # Luôn dùng contexts[0] — 1 context duy nhất
-        if _camoufox_instance.contexts:
-            _shared_context = _camoufox_instance.contexts[0]
-        else:
-            _shared_context = await _camoufox_instance.new_context()
+        if _playwright_driver is None:
+            _playwright_driver = await async_playwright().start()
 
-        logger.info(f"[Camoufox] Shared context sẵn sàng — tất cả tab dùng chung")
+        mon = _get_secondary_monitor_rect()          # ← màn hình PHỤ (1600x900)
+        mon_w = mon["right"]  - mon["left"]
+        mon_h = mon["bottom"] - mon["top"]
+        # Xáo trộn nội bộ: kích thước dao động ±5% để tránh fingerprint cố định
+        import random as _rnd
+        scale_w = _rnd.uniform(0.88, 0.96)
+        scale_h = _rnd.uniform(0.88, 0.96)
+        win_w = int(mon_w * scale_w)
+        win_h = int(mon_h * scale_h)
+        # Offset nhỏ từ góc trên-trái để không bị cắt viền
+        off_x = _rnd.randint(0, max(0, mon_w - win_w))
+        off_y = _rnd.randint(0, max(0, 30))
+
+        profile_dir = get_user_profile_dir("shared")
+        Path(profile_dir).mkdir(parents=True, exist_ok=True)
+
+        _shared_context = await _playwright_driver.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            channel="msedge",
+            headless=headless,
+            viewport={"width": win_w, "height": win_h},
+            args=[
+                f"--window-position={mon['left'] + off_x},{mon['top'] + off_y}",
+                f"--window-size={win_w},{win_h}",
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+        )
+        logger.info(f"[Edge] Browser launched thành công")
+        # Ghim cửa sổ vào màn hình PHỤ (args ở trên đặt vị trí ban đầu, MoveWindow chỉnh lại cho chắc)
+        await asyncio.sleep(1.0)
+        hwnd = _find_edge_hwnd()
+        if hwnd:
+            ctypes.windll.user32.MoveWindow(
+                hwnd,
+                mon["left"] + off_x,   # X tuyệt đối trên màn phụ
+                mon["top"]  + off_y,   # Y tuyệt đối trên màn phụ
+                win_w, win_h,
+                True,
+            )
+            logger.info(
+                f"[Edge] Cửa sổ → màn phụ ({win_w}x{win_h} "
+                f"@ {mon['left']+off_x},{mon['top']+off_y})"
+            )
+
+        logger.info(f"[Edge] Context sẵn sàng — tất cả tab dùng chung")
         return _shared_context
 
 
@@ -729,7 +744,7 @@ async def init_systems():
     anti_det = init_anti_detection()
     _, _, perf_mon = init_monitoring()
 
-    # ✅ v7.5+: Camoufox thay Playwright — không cần playwright_instance nữa
+    # ✅ v7.6: Edge (qua Playwright launch_persistent_context) — không dùng CDP port riêng nữa
     # bot_state.playwright_instance dùng làm sentinel check ở một số chỗ → set dummy
     bot_state.playwright_instance = True
     get_shutdown_handler().setup(bot_state)
@@ -761,19 +776,19 @@ async def notify_admin(msg: str):
         logger.debug(f"notify_admin error: {e}")
 
 
-# ── Camoufox window: minimize xuống taskbar / restore lên ──────────────────
-_camoufox_hwnd: int = 0  # cache HWND của cửa sổ Camoufox
+# ── Edge window: minimize xuống taskbar / restore lên ──────────────────
+_edge_hwnd: int = 0  # cache HWND của cửa sổ Edge
 
-def _find_camoufox_hwnd() -> int:
+def _find_edge_hwnd() -> int:
     """
-    Tìm HWND chính của Camoufox — lấy cửa sổ có diện tích LỚN NHẤT.
-    Đồng thời ẩn (SW_HIDE) tất cả cửa sổ Camoufox phụ để chỉ còn 1.
+    Tìm HWND chính của Edge — lấy cửa sổ có diện tích LỚN NHẤT.
+    Đồng thời ẩn (SW_HIDE) tất cả cửa sổ Edge phụ để chỉ còn 1.
     """
-    global _camoufox_hwnd
-    if _camoufox_hwnd:
-        if ctypes.windll.user32.IsWindow(_camoufox_hwnd):
-            return _camoufox_hwnd
-        _camoufox_hwnd = 0
+    global _edge_hwnd
+    if _edge_hwnd:
+        if ctypes.windll.user32.IsWindow(_edge_hwnd):
+            return _edge_hwnd
+        _edge_hwnd = 0
 
     found = []
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool,
@@ -788,7 +803,7 @@ def _find_camoufox_hwnd() -> int:
         buf = ctypes.create_unicode_buffer(length + 1)
         ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
         title = buf.value.lower()
-        if any(k in title for k in ("firefox", "camoufox", "mozilla", "new tab")):
+        if any(k in title for k in ("edge", "new tab")):
             rect = ctypes.wintypes.RECT()
             ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
             w = rect.right  - rect.left
@@ -803,7 +818,7 @@ def _find_camoufox_hwnd() -> int:
 
     # Lấy cửa sổ to nhất = cửa sổ chính
     found.sort(key=lambda x: x[0], reverse=True)
-    _camoufox_hwnd = found[0][1]
+    _edge_hwnd = found[0][1]
 
     # Ẩn tất cả cửa sổ phụ (nhỏ hơn) — chỉ giữ cửa sổ chính
     for _, hwnd in found[1:]:
@@ -812,18 +827,18 @@ def _find_camoufox_hwnd() -> int:
         except Exception:
             pass
 
-    return _camoufox_hwnd
+    return _edge_hwnd
 
 
-def camoufox_minimize():
-    """Minimize cửa sổ Camoufox xuống taskbar."""
+def edge_minimize():
+    """Minimize cửa sổ Edge xuống taskbar."""
     try:
-        hwnd = _find_camoufox_hwnd()
+        hwnd = _find_edge_hwnd()
         if hwnd:
             ctypes.windll.user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE = 6
-            logger.debug("🔽 Camoufox minimized xuống taskbar")
+            logger.debug("🔽 Edge minimized xuống taskbar")
     except Exception as e:
-        logger.debug(f"camoufox_minimize error: {e}")
+        logger.debug(f"edge_minimize error: {e}")
 
 
 def _get_primary_monitor_rect():
@@ -894,16 +909,16 @@ def _get_secondary_monitor_rect():
     return {"left": 0, "top": 0, "right": 1600, "bottom": 900, "primary": True}
 
 
-def camoufox_restore(page=None):
-    """Restore Camoufox lên foreground."""
+def edge_restore(page=None):
+    """Restore Edge lên foreground."""
     try:
-        hwnd = _find_camoufox_hwnd()
+        hwnd = _find_edge_hwnd()
         if not hwnd:
             return
         ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         ctypes.windll.user32.SetForegroundWindow(hwnd)
     except Exception as e:
-        logger.debug(f"camoufox_restore error: {e}")
+        logger.debug(f"edge_restore error: {e}")
 
 
 async def is_cloudflare_present(page) -> bool:
@@ -1773,18 +1788,18 @@ async def wait_for_manual_verification_and_fill_accounts(account_targets: list):
             await notify_admin(
                 f"⏳ BOT đang chờ xác minh Cloudflare thủ công!\n"
                 f"🌐 Các site cần xác minh: {', '.join(sorted(pending))}\n"
-                f"👉 Mở cửa sổ Camoufox và click xác minh!"
+                f"👉 Mở cửa sổ Edge và click xác minh!"
             )
 
     logger.info("✅ TẤT CẢ CỬA SỔ ĐÃ XÁC MINH XONG — bot sẵn sàng nhận và submit code.")
-    camoufox_minimize()  # Minimize sau khi xác minh xong — đợi code
+    edge_minimize()  # Minimize sau khi xác minh xong — đợi code
 
 
 # ── Dual-Tab Pool (2 tab song song, on-demand navigation) ──────────────────
 TAB_POOL_SIZE = 1            # 1 tab duy nhất — mở khi có code, đóng sau submit
 
 class TabPool:
-    """Pool 2 tab Camoufox — mỗi submit lấy 1 tab rảnh, xong trả lại."""
+    """Pool 2 tab Edge — mỗi submit lấy 1 tab rảnh, xong trả lại."""
 
     def __init__(self, size: int = 2):
         self.size      = size
@@ -1797,7 +1812,7 @@ class TabPool:
         context  = await get_or_launch_browser_context("shared")
         self._sem = asyncio.Semaphore(self.size)
 
-        # Dùng tab sẵn có của Camoufox trước
+        # Dùng tab sẵn có của Edge trước
         existing = list(context.pages)
 
         for i in range(self.size):
@@ -1824,9 +1839,9 @@ class TabPool:
         1 tab duy nhất — lazy init khi có code đầu tiên.
         Nếu tab đang bận thì chờ.
         """
-        # Lazy init: mở Camoufox lần đầu khi có code thật
+        # Lazy init: mở Edge lần đầu khi có code thật
         if not self._pages:
-            logger.info("🚀 [Lazy] Lần đầu có code — khởi động Camoufox...")
+            logger.info("🚀 [Lazy] Lần đầu có code — khởi động Edge...")
             await self.init()
 
         # Chờ tab rảnh
@@ -1875,7 +1890,7 @@ async def get_shared_page():
 async def preload_browsers_and_accounts():
     """
     Single-Tab On-Demand: không mở trước 8 tab.
-    Chỉ khởi động Camoufox + 1 tab blank, đăng ký keys vào bot_state.
+    Chỉ khởi động Edge + 1 tab blank, đăng ký keys vào bot_state.
     Tab sẽ navigate đến đúng site khi có code cần submit.
     → Tiết kiệm RAM, không có tab thừa.
     """
@@ -1888,8 +1903,8 @@ async def preload_browsers_and_accounts():
         logger.error("❌ No channels configured")
         return
 
-    # LAZY LAUNCH: không mở Camoufox ngay — chỉ tạo TabPool rỗng
-    # Camoufox sẽ tự mở lần đầu khi có code cần submit
+    # LAZY LAUNCH: không mở Edge ngay — chỉ tạo TabPool rỗng
+    # Edge sẽ tự mở lần đầu khi có code cần submit
     global _tab_pool
     _tab_pool = TabPool(size=1)
     # Không gọi _tab_pool.init() ở đây — init() sẽ được gọi lần đầu trong acquire()
@@ -1903,7 +1918,7 @@ async def preload_browsers_and_accounts():
         logger.info(f"  ✅ Đăng ký kênh: {key}")
 
     logger.info(f"✅ {len(account_targets)} kênh đăng ký xong — bot chờ code")
-    logger.info("🤖 BOT RUNNING — Camoufox sẽ mở khi có code đầu tiên...")
+    logger.info("🤖 BOT RUNNING — Edge sẽ mở khi có code đầu tiên...")
 
 
 # ============================================================
@@ -2531,7 +2546,7 @@ async def submit_code_safe(user: str, code: str, target_url: str, systems: dict)
                     or domain not in page_url.lower())
         if need_nav:
             logger.info(f"🌐 [Tab-{tab_idx}|{domain}] Điều hướng tới {target_url}")
-            camoufox_restore()
+            edge_restore()
             try:
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=12000)
                 await scroll_to_input_fields(page)
@@ -2543,7 +2558,7 @@ async def submit_code_safe(user: str, code: str, target_url: str, systems: dict)
                 return {"success": False, "message": "Goto failed"}
 
             await _wake_tab_for_submit(page)
-            camoufox_restore()  # Hiện cửa sổ lên khi bắt đầu submit
+            edge_restore()  # Hiện cửa sổ lên khi bắt đầu submit
 
             # --- Check for Cloudflare/Turnstile presence and do NOT auto-bypass ---
             if await is_cloudflare_present(page):
@@ -2558,7 +2573,7 @@ async def submit_code_safe(user: str, code: str, target_url: str, systems: dict)
                     f"🌐 Site: {domain}\n"
                     f"👤 Tài khoản: {user}\n"
                     f"🔑 Code đang submit: {code}\n"
-                    f"👉 Mở cửa sổ Camoufox và xác minh thủ công!"
+                    f"👉 Mở cửa sổ Edge và xác minh thủ công!"
                 )
                 bot_state.cf_verified[key] = False
                 return {"success": False, "message": "Cloudflare challenge present"}
@@ -2707,7 +2722,7 @@ async def submit_code_safe(user: str, code: str, target_url: str, systems: dict)
                 except Exception:
                     pass
                 _tab_pool.release()
-                await close_camoufox_after_submit()
+                await close_edge_after_submit()
                 return {
                     "success": True,
                     "has_points": has_points,
@@ -2763,7 +2778,7 @@ async def submit_code_safe(user: str, code: str, target_url: str, systems: dict)
                     except Exception as reload_err:
                         logger.error(f"❌ [{domain}] Reload thất bại: {reload_err}")
                 _tab_pool.release()
-                await close_camoufox_after_submit()
+                await close_edge_after_submit()
                 return {"success": False, "message": "No popup"}
 
             screenshot = await take_result_screenshot(
@@ -4196,14 +4211,15 @@ async def cloudflare_watchdog():
             pass
 
 
-async def close_camoufox_after_submit():
+async def close_edge_after_submit():
     """
-    Đóng hẳn Camoufox sau khi submit xong.
+    Đóng hẳn Edge sau khi submit xong.
     Lần sau có code mới → lazy init mở lại.
     """
-    global _camoufox_instance, _shared_context, _camoufox_hwnd, _tab_pool
+    global _shared_context, _edge_hwnd, _tab_pool
     try:
-        # Đóng context
+        # Đóng context — với launch_persistent_context, context.close() đóng
+        # luôn cả trình duyệt (không có browser instance riêng để đóng thêm).
         if _shared_context is not None:
             try:
                 await _shared_context.close()
@@ -4211,43 +4227,42 @@ async def close_camoufox_after_submit():
                 pass
             _shared_context = None
 
-        # Đóng browser
-        if _camoufox_instance is not None:
-            try:
-                await _camoufox_instance.__aexit__(None, None, None)
-            except Exception:
-                pass
-            _camoufox_instance = None
-
         # Reset tab pool để lazy init lại lần sau
-        _camoufox_hwnd = 0
+        _edge_hwnd = 0
         _playwright_contexts.clear()
         if _tab_pool is not None:
             _tab_pool._pages.clear()
             _tab_pool._locks.clear()
 
-        logger.info("🔒 Camoufox đã đóng — chờ code tiếp theo")
+        logger.info("🔒 Edge đã đóng — chờ code tiếp theo")
     except Exception as e:
-        logger.debug(f"close_camoufox error: {e}")
+        logger.debug(f"close_edge_after_submit error: {e}")
 
 
 async def cleanup_browsers():
     """Close all browser connections."""
-    global _camoufox_instance
-    # Đóng các context Playwright/Camoufox đang mở
+    global _shared_context, _playwright_driver
+    # Đóng các context Playwright đang mở
     for key, ctx in list(_playwright_contexts.items()):
         try:
             await ctx.close()
         except Exception:
             pass
     _playwright_contexts.clear()
-    # Đóng Camoufox browser instance
-    if _camoufox_instance is not None:
+    # Đóng context Edge chính (đóng luôn cả trình duyệt vì là persistent context)
+    if _shared_context is not None:
         try:
-            await _camoufox_instance.__aexit__(None, None, None)
+            await _shared_context.close()
         except Exception:
             pass
-        _camoufox_instance = None
+        _shared_context = None
+    # Dừng hẳn Playwright driver
+    if _playwright_driver is not None:
+        try:
+            await _playwright_driver.stop()
+        except Exception:
+            pass
+        _playwright_driver = None
     # Legacy CDP browsers
     for port, browser in bot_state.connected_browsers.items():
         try:
@@ -4478,7 +4493,7 @@ async def main():
         await cleanup_browsers()
         build_daily_summary()
 
-        # ✅ v7.5+: Camoufox đã được đóng trong cleanup_browsers() — không cần stop playwright
+        # ✅ v7.5+: Edge đã được đóng trong cleanup_browsers() — không cần stop playwright
 
         logger.info("✅ Shutdown complete")
 
